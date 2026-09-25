@@ -20,68 +20,89 @@
 
 #define PORT 9090
 
-static std::vector<std::shared_ptr<SocketGuard>> ClientSockets;//管理SOCKET实例
-static std::unordered_map<SOCKET,std::shared_ptr<SocketGuard>>SocketHandleToSocketGuard_ptr_Map;//通过Socket找到SocketGuard的指针
-static std::unordered_map<SOCKET,uint32_t> ClientSocketHandle_ptrToID_Map;//通过SOCKET查找对应的用户ID
-static std::unordered_map<uint32_t,SOCKET> IDToClientSocketHandle_ptr_Map;//通过用户ID查找对应SOCKET
-static std::mutex ClientSocketsAndIDMapMutex;//对三个变量的锁
+static std::vector<std::shared_ptr<SocketGuard>> ClientSockets;//管理所有SOCKET指针
+static std::unordered_map<std::shared_ptr<SocketGuard>,uint32_t> ClientSocket_ptrToID_Map;//通过SocketGuard指针查找对应的用户ID
+static std::unordered_map<uint32_t,std::shared_ptr<SocketGuard>> IDToClientSocket_ptr_Map;//通过用户ID查找对应SocketGuard指针
+static std::mutex ClientSocketsAndIDMapMutex;//对2个Map变量的锁
+static std::mutex ClientSocketsMutex;//对ClientSockets的锁
 
 static std::mutex IOMutex;
 
-static std::mutex ClientSocketsMutex;
+
 static ThreadsPool& MyThreadsPool=ThreadsPool::InitThreadPool(10);
 
 
-static void SendMessagesToClient(const SOCKET& ClientSocketHandle,const std::string& msg) {
+static bool SendMessagesToClient(const std::shared_ptr<SocketGuard> ClientSocket,const std::string& msg) {
     Message WarnMessage;
     WarnMessage.UserIDSender=0;
 
     std::unique_lock<std::mutex> lock(ClientSocketsAndIDMapMutex);
-    WarnMessage.UserIDReceiver=ClientSocketHandle_ptrToID_Map[ClientSocketHandle];
+    WarnMessage.UserIDReceiver=ClientSocket_ptrToID_Map[ClientSocket];
     lock.unlock();
 
     WarnMessage.MessageType=static_cast<uint32_t>(MessageType::Server);
     WarnMessage.TextMessage=msg;
     auto[pkg,len]=ConvertMessagesToNetStream(WarnMessage);
 
-    if (SendMessages(ClientSocketHandle,pkg.data(),len)) {//调用发送消息函数
+    if (SendMessages(ClientSocket->SocketHandle,pkg.data(),len)) {//调用发送消息函数
         std::unique_lock<std::mutex> IOlock(IOMutex);
         std::cout<<"Send message successfully"<<std::endl;
+        return true;
     }else {
         std::unique_lock<std::mutex> IOlock(IOMutex);
         std::cout<<"Send message failed:"<<WSAGetLastError()<<std::endl;
+        return false;
     }
 }
 
-static bool ForwardMessagesThread(SOCKET& ClientSocketHandle) {
-    std::stop_callback unblock{MyThreadsPool.StopSource.get_token(),[&]() {
-        SocketHandleToSocketGuard_ptr_Map[ClientSocketHandle]->CloseSocketHandle();
-    }};
+static bool ProbeThread(const std::shared_ptr<SocketGuard> ClientSocket) {
     while (true) {
-        auto OptMessageJudging = RecvMessages(std::ref(ClientSocketHandle));
+        bool ClientStillAlive=SendMessagesToClient(ClientSocket,Message::ProbeMessage);
+        if (ClientStillAlive==false) {
+
+        }else {
+            continue;
+        }
+    }
+}
+
+static bool ForwardMessagesThread(std::shared_ptr<SocketGuard> ClientSocket) {
+    std::stop_callback unblock{MyThreadsPool.StopSource.get_token(),[&]() {
+        ClientSocket->CloseSocketHandle();
+    }};
+
+    //客户端关闭时调用的清理函数
+    auto CloseSocket=[&]() {
+        std::unique_lock<std::mutex> lock(ClientSocketsAndIDMapMutex);
+        std::unique_lock<std::mutex> ClientsSocketlock(ClientSocketsMutex);
+
+        //清除服务器存储的客户端信息
+        uint32_t ClientID = 0;
+        if (const auto ClientIDIterator = ClientSocket_ptrToID_Map.find(ClientSocket);
+            ClientIDIterator != ClientSocket_ptrToID_Map.end()) {
+                std::erase(ClientSockets,ClientSocket);          // 删 vector成员
+                ClientID = ClientIDIterator->second;
+                ClientSocket_ptrToID_Map.erase(ClientIDIterator);//清除Socket指针到ID的表
+            }
+        if (ClientID != 0) {
+            IDToClientSocket_ptr_Map.erase(ClientID);//清除ID到Socket指针的表
+        }
+        ClientSocket->CloseSocketHandle();
+        lock.unlock();
+        ClientsSocketlock.unlock();
+    };
+
+    while (true) {
+        auto OptMessageJudging = RecvMessages(std::ref(ClientSocket->SocketHandle));//阻塞接收
         if (OptMessageJudging==std::nullopt) {
+            CloseSocket();
+            std::unique_lock<std::mutex> IOlock(IOMutex);
+            std::cout<<"Client Error Quit"<<std::endl;
             return false;
         }
         //安全退出
         if (OptMessageJudging.value().MessageType==static_cast<uint32_t>(MessageType::ClientSafeQuit)) {
-            std::unique_lock<std::mutex> lock(ClientSocketsAndIDMapMutex);
-            std::unique_lock<std::mutex> ClientsSocketlock(ClientSocketsMutex);
-
-            //清除服务器存储的客户端信息
-            uint32_t ClientID = 0;
-            if (const auto ClientIDIterator = ClientSocketHandle_ptrToID_Map.find(ClientSocketHandle);
-                ClientIDIterator != ClientSocketHandle_ptrToID_Map.end()) {
-                    ClientID = ClientIDIterator->second;
-                    ClientSocketHandle_ptrToID_Map.erase(ClientIDIterator);
-                }
-            if (ClientID != 0) {
-                IDToClientSocketHandle_ptr_Map.erase(ClientID);
-            }
-            //关闭对应SOCKET
-            SocketHandleToSocketGuard_ptr_Map[ClientSocketHandle]->CloseSocketHandle();
-            std::erase(ClientSockets,SocketHandleToSocketGuard_ptr_Map[ClientSocketHandle]);
-
-            lock.unlock();
+            CloseSocket();
             std::unique_lock<std::mutex> IOlock(IOMutex);
             std::cout<<"Client Safe Quit"<<std::endl;
             return true;
@@ -91,17 +112,29 @@ static bool ForwardMessagesThread(SOCKET& ClientSocketHandle) {
         //检测登录合法性
         if (getMessage.MessageType==static_cast<uint32_t>(MessageType::Login)) {
             std::unique_lock<std::mutex> lock(ClientSocketsAndIDMapMutex);
-            if (IDToClientSocketHandle_ptr_Map.contains(getMessage.UserIDSender)) {//ID已被使用
+            if (getMessage.UserIDSender==0) {
                 lock.unlock();
-                SendMessagesToClient(std::ref(ClientSocketHandle),Message::LoginFailedToken_UsedID);
+                SendMessagesToClient(ClientSocket,Message::LoginFailedToken_IDis0);
                 std::unique_lock<std::mutex> IOlock(IOMutex);
-                std::cout<<"Login Failed!"<<std::endl;
+                std::cout<<"Login Failed,ID can't be 0!"<<std::endl;
+            }
+            else if (ClientSocket_ptrToID_Map[ClientSocket]!=0) {//ID已被使用(本机重复登陆)
+                lock.unlock();
+                SendMessagesToClient(ClientSocket,Message::LoginFailedToken_UsedID);
+                std::unique_lock<std::mutex> IOlock(IOMutex);
+                std::cout<<"Login Failed,ID have been used!"<<std::endl;
+            }
+            else if (IDToClientSocket_ptr_Map.contains(getMessage.UserIDSender)) {//ID已被使用
+                lock.unlock();
+                SendMessagesToClient(ClientSocket,Message::LoginFailedToken_UsedID);
+                std::unique_lock<std::mutex> IOlock(IOMutex);
+                std::cout<<"Login Failed,ID have been used!"<<std::endl;
             }
             else {//合法登陆ID
-                ClientSocketHandle_ptrToID_Map[ClientSocketHandle]=getMessage.UserIDSender;
-                IDToClientSocketHandle_ptr_Map[getMessage.UserIDSender]=ClientSocketHandle;
+                ClientSocket_ptrToID_Map[ClientSocket]=getMessage.UserIDSender;
+                IDToClientSocket_ptr_Map[getMessage.UserIDSender]=ClientSocket;
                 lock.unlock();
-                SendMessagesToClient(std::ref(ClientSocketHandle),Message::LoginSuccessfulToken);
+                SendMessagesToClient(ClientSocket,Message::LoginSuccessfulToken);
                 std::unique_lock<std::mutex> IOlock(IOMutex);
                 std::cout<<"Login successfully!!!"<<std::endl;
             }
@@ -109,30 +142,28 @@ static bool ForwardMessagesThread(SOCKET& ClientSocketHandle) {
         //检测目标ID合法性
         else if (getMessage.MessageType==static_cast<uint32_t>(MessageType::CheckID)) {
             uint32_t TargetUserID=getMessage.UserIDReceiver;
-
             if (TargetUserID==0) {
-                SendMessagesToClient(std::ref(ClientSocketHandle),Message::IDIllegal_IDis0);
+                SendMessagesToClient(ClientSocket,Message::IDIllegal_IDis0);
                 std::unique_lock<std::mutex> IOlock(IOMutex);
                 std::cout<<"Target User ID can't be 0!"<<std::endl;
             }
-
             std::unique_lock<std::mutex> lock(ClientSocketsAndIDMapMutex);
-            if (TargetUserID!=0 && IDToClientSocketHandle_ptr_Map.contains(TargetUserID)) {//键存在
-                if (IDToClientSocketHandle_ptr_Map[getMessage.UserIDReceiver]!=ClientSocketHandle) {
+            if (TargetUserID!=0 && IDToClientSocket_ptr_Map.contains(TargetUserID)) {//键存在
+                if (IDToClientSocket_ptr_Map[getMessage.UserIDReceiver]!=ClientSocket) {
                     lock.unlock();
-                    SendMessagesToClient(std::ref(ClientSocketHandle),Message::IDLegal);
+                    SendMessagesToClient(ClientSocket,Message::IDLegal);
                     std::unique_lock<std::mutex> IOlock(IOMutex);
                     std::cout<<"Target User ID is Legal"<<std::endl;
                 }else {
                     lock.unlock();
-                    SendMessagesToClient(std::ref(ClientSocketHandle),Message::IDIllegal_TargetSelf);
+                    SendMessagesToClient(ClientSocket,Message::IDIllegal_TargetSelf);
                     std::unique_lock<std::mutex> IOlock(IOMutex);
                     std::cout<<"Target User ID can't be self!"<<std::endl;
                 }
             }
             else{
                 lock.unlock();
-                SendMessagesToClient(std::ref(ClientSocketHandle),Message::IDIllegal_Invalid);
+                SendMessagesToClient(ClientSocket,Message::IDIllegal_Invalid);
                 std::unique_lock<std::mutex> IOlock(IOMutex);
                 std::cout<<"Target is Missing!"<<std::endl;
             }
@@ -142,18 +173,28 @@ static bool ForwardMessagesThread(SOCKET& ClientSocketHandle) {
             //发送消息给接收端
             std::unique_lock<std::mutex> lock(ClientSocketsAndIDMapMutex);
             uint32_t TargetUserID=getMessage.UserIDReceiver;
-            auto TargetSocketHandle=IDToClientSocketHandle_ptr_Map[TargetUserID];
+            std::shared_ptr<SocketGuard> TargetSocket;
+            const auto TargetIDIterator=IDToClientSocket_ptr_Map.find(TargetUserID);
+            if (TargetIDIterator!=IDToClientSocket_ptr_Map.end()) {
+                TargetSocket=TargetIDIterator->second;
+            }
             lock.unlock();
-            SendMessages(TargetSocketHandle,getMessage.RawMessageNetStream.c_str(),static_cast<int>(getMessage.RawMessageNetStream.size()));
-
-            //通知发送端发送成功
-            SendMessagesToClient(std::ref(ClientSocketHandle),Message::SendSuccessfully);
-            std::unique_lock<std::mutex> IOlock(IOMutex);
-            std::cout<<"Forward message successfully!"<<std::endl;
+            if (TargetSocket==nullptr) {
+                SendMessagesToClient(ClientSocket,Message::SendFailed);
+                std::cout<<"Target "<<TargetUserID<<" is offline, message dropped"<<std::endl;
+                continue;
+            }else {
+                SendMessages(TargetSocket->SocketHandle,getMessage.RawMessageNetStream.c_str(),static_cast<int>(getMessage.RawMessageNetStream.size()));
+                //通知发送端发送成功
+                SendMessagesToClient(ClientSocket,Message::SendSuccessfully);
+                std::unique_lock<std::mutex> IOlock(IOMutex);
+                std::cout<<"Forward message successfully!"<<std::endl;
+            }
         }
         //其他异常消息
         else {
-            SendMessagesToClient(std::ref(ClientSocketHandle),Message::SendFailed);
+            SendMessagesToClient(ClientSocket,Message::SendFailed);
+            CloseSocket();
             std::unique_lock<std::mutex> IOlock(IOMutex);
             std::cout<<"Forward message failed:"<<WSAGetLastError()<<std::endl;
             return false;
@@ -171,15 +212,14 @@ static void AcceptThread(const SocketGuard& ListeningSocket) {
             return;
         }
         else {
-                {
-                    std::unique_lock<std::mutex> ClientSocketlock(ClientSocketsMutex);
-                    ClientSockets.push_back(std::move(ClientSocket));
+            //保存客户端信息
+            std::unique_lock<std::mutex> Maplock(ClientSocketsAndIDMapMutex);
+            std::unique_lock<std::mutex> ClientSocketlock(ClientSocketsMutex);
+            ClientSockets.push_back(std::move(ClientSocket));//存SOCKETGUARD指针
 
-                    std::unique_lock<std::mutex> Maplock(ClientSocketsAndIDMapMutex);
-                    SocketHandleToSocketGuard_ptr_Map[ClientSockets.back()->SocketHandle]=ClientSockets.back();//把Socket对应的指针存入
-                    ClientSocketHandle_ptrToID_Map[ClientSockets.back()->SocketHandle]=0;
-                    MyThreadsPool.AddTask(ForwardMessagesThread,std::ref(ClientSockets.back()->SocketHandle));
-                }
+            ClientSocket_ptrToID_Map[ClientSockets.back()]=0;//给当前客户端占位,等待ID到达后填入
+
+            MyThreadsPool.AddTask(ForwardMessagesThread,ClientSockets.back());//开启转发线程
 
             std::unique_lock<std::mutex> IOlock(IOMutex);
             std::cout<<"Client accepted successfully,handle id:"<<ClientSockets.back()->SocketHandle<<std::endl;

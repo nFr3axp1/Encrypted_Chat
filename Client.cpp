@@ -18,7 +18,7 @@
 #define IP "127.0.0.1"
 #define PORT 9090
 
-static ThreadsPool& MyThreadsPool=ThreadsPool::InitThreadPool(8);
+static ThreadsPool& MyThreadsPool=ThreadsPool::InitThreadPool(10);
 static Message MyMessage{};
 
 static bool HaveReplyLogged=false,HaveLogged=false;
@@ -28,12 +28,12 @@ static std::mutex IOMutex,LoginMutex,IDJudgingMutex;
 static std::condition_variable LoginCV,IDJudgingCV;
 
 
-static void LoginRequest(const SOCKET& ConnectToServerSocketHandle) {
+static void LoginRequest(const SocketGuard& ConnectToServerSocket) {
     MyMessage.MessageType=static_cast<uint32_t>(MessageType::Login);
     MyMessage.UserIDReceiver=0;
 
     auto [pkg,len]=ConvertMessagesToNetStream(MyMessage);//将消息转换为网络字节流
-    SendMessages(ConnectToServerSocketHandle,pkg.data(),len); //调用发送消息函数
+    SendMessages(ConnectToServerSocket.SocketHandle,pkg.data(),len); //调用发送消息函数
 }
 
 static bool WaitingLoginReply() {
@@ -58,7 +58,7 @@ static bool WaitingIDJudging() {
     }
 }
 
-static bool SendMessagesThread(const SOCKET& ConnectToServerSocketHandle) {//正常关闭返回true
+static bool SendMessagesThread(const SocketGuard& ConnectToServerSocket) {//正常关闭返回true
     while (true) {
         MyMessage.MessageType=static_cast<uint32_t>(MessageType::CheckID);
         //输入目标用户ID
@@ -69,14 +69,8 @@ static bool SendMessagesThread(const SOCKET& ConnectToServerSocketHandle) {//正
 
             CinRtStatus GetCinRtStatuts=InputCheck(MyMessage.UserIDReceiver);
             if (GetCinRtStatuts==CinRtStatus::Legal) {
-                if (MyMessage.UserIDReceiver==0) {
-                    IOlock.lock();
-                    std::cout<<"0 can't be used!"<<std::endl;
-                    IOlock.unlock();
-                }
-                else {
-                    break;
-                }
+                //迁移ID判断到服务端
+                break;
             }else if (GetCinRtStatuts==CinRtStatus::Illegal) {
                 IOlock.lock();
                 std::cout<<"Illegal Input!"<<std::endl;
@@ -87,7 +81,7 @@ static bool SendMessagesThread(const SOCKET& ConnectToServerSocketHandle) {//正
         }
         //检测ID合法性
         auto [pkg_only_id,len_only_id]=ConvertMessagesToNetStream(MyMessage);//将消息转换为网络字节流
-        SendMessages(ConnectToServerSocketHandle,pkg_only_id.data(),len_only_id);//调用发送消息函数
+        SendMessages(ConnectToServerSocket.SocketHandle,pkg_only_id.data(),len_only_id);//调用发送消息函数
 
         auto IDJudgingResult=MyThreadsPool.AddTask(WaitingIDJudging);
         if (IDJudgingResult.get()) {//ID合法
@@ -105,25 +99,26 @@ static bool SendMessagesThread(const SOCKET& ConnectToServerSocketHandle) {//正
             if (MyMessage.TextMessage=="quit") {
                 MyMessage.MessageType=static_cast<uint32_t>(MessageType::ClientSafeQuit);
                 auto [pkg,len]=ConvertMessagesToNetStream(MyMessage);//将消息转换为网络字节流
-                SendMessages(ConnectToServerSocketHandle,pkg.data(),len);
-                shutdown(ConnectToServerSocketHandle,SD_SEND);
+                SendMessages(ConnectToServerSocket.SocketHandle,pkg.data(),len);
+                shutdown(ConnectToServerSocket.SocketHandle,SD_SEND);
                 return true;
             }
 
             //开始发包
             auto [pkg,len]=ConvertMessagesToNetStream(MyMessage);//将消息转换为网络字节流
-            SendMessages(ConnectToServerSocketHandle,pkg.data(),len);//调用发送消息函数
+            SendMessages(ConnectToServerSocket.SocketHandle,pkg.data(),len);//调用发送消息函数
         }
-        else {
+        else {//ID非法
             //由recv获取ID非法的原因，此处直接重头开始循环获取输入
+            continue;
         }
     }
     return true;
 }
 
-static bool RecvMessagesThread(SOCKET& ConnectToServerSocketHandle) {//接受消息,正常退出返回true,异常返回false
+static bool RecvMessagesThread(const SocketGuard& ConnectToServerSocket) {//接受消息,正常退出返回true,异常返回false
     while (true) {
-        auto OptMessageJudging = RecvMessages(std::ref(ConnectToServerSocketHandle));
+        auto OptMessageJudging = RecvMessages(ConnectToServerSocket.SocketHandle);
 
         if (OptMessageJudging==std::nullopt) {
             return false;
@@ -139,7 +134,8 @@ static bool RecvMessagesThread(SOCKET& ConnectToServerSocketHandle) {//接受消
                 HaveReplyLogged=true;
                 Loginlock.unlock();
                 LoginCV.notify_all();
-            }else if (getMessage.TextMessage==Message::LoginFailedToken_UsedID){//登录相关:ID已被占用
+            }
+            else if (getMessage.TextMessage==Message::LoginFailedToken_UsedID||getMessage.TextMessage==Message::LoginFailedToken_IDis0){//登录相关:ID已被占用或ID为0
                 std::unique_lock<std::mutex> Loginlock(LoginMutex);
                 HaveLogged=false;
                 HaveReplyLogged=true;
@@ -175,7 +171,6 @@ static bool RecvMessagesThread(SOCKET& ConnectToServerSocketHandle) {//接受消
             const Message& getMessage=OptMessageJudging.value();
             std::unique_lock<std::mutex> IOlock(IOMutex);
             std::cout<<std::endl<<"Message Come from ID:"<<getMessage.UserIDSender<<" Contents:"<<getMessage.TextMessage;
-            //std::cout<<"Message Come from ID:"<<getMessage.UserIDSender<<" Contents:"<<getMessage.TextMessage<<std::endl;
         }
     }
 }
@@ -212,7 +207,7 @@ int main() {
     std::cout<<"connected successfully!"<<std::endl;
     IOlock.unlock();
 
-    MyThreadsPool.AddTask(RecvMessagesThread,std::ref(ConnectToServerSocket.SocketHandle));
+    MyThreadsPool.AddTask(RecvMessagesThread,std::ref(ConnectToServerSocket));
 
     while (true) {
         IOlock.lock();
@@ -220,17 +215,11 @@ int main() {
         IOlock.unlock();
         CinRtStatus GetCinRtStatuts=InputCheck(MyMessage.UserIDSender);
         if (GetCinRtStatuts==CinRtStatus::Legal){
-            if (MyMessage.UserIDSender==0) {
-                std::unique_lock<std::mutex> IOlock2(IOMutex);
-                std::cout<<"0 can't be used!"<<std::endl;
-            }
-            else{
-                auto LoginResult=MyThreadsPool.AddTask(WaitingLoginReply);
-                LoginRequest(ConnectToServerSocket.SocketHandle);
-                if (LoginResult.get()) {
-                    //登陆成功
-                    break;
-                }
+            auto LoginResult=MyThreadsPool.AddTask(WaitingLoginReply);
+            LoginRequest(ConnectToServerSocket);
+            if (LoginResult.get()) {
+                //登陆成功,ID检验全部放服务端
+                break;
             }
         }
         else if (GetCinRtStatuts==CinRtStatus::Illegal) {
@@ -243,7 +232,7 @@ int main() {
         }
     }
 
-    auto SendThreadRtStatus=MyThreadsPool.AddTask(SendMessagesThread,std::ref(ConnectToServerSocket.SocketHandle));
+    auto SendThreadRtStatus=MyThreadsPool.AddTask(SendMessagesThread,std::ref(ConnectToServerSocket));
     if (SendThreadRtStatus.get()) {//正常关闭
         Quit(ConnectToServerSocket);
         return 0;
