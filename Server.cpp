@@ -65,13 +65,22 @@ static bool ForwardMessagesThread(SOCKET& ClientSocketHandle) {
         //安全退出
         if (OptMessageJudging.value().MessageType==static_cast<uint32_t>(MessageType::ClientSafeQuit)) {
             std::unique_lock<std::mutex> lock(ClientSocketsAndIDMapMutex);
+            std::unique_lock<std::mutex> ClientsSocketlock(ClientSocketsMutex);
+
+            //清除服务器存储的客户端信息
+            uint32_t ClientID = 0;
+            if (const auto ClientIDIterator = ClientSocketHandle_ptrToID_Map.find(ClientSocketHandle);
+                ClientIDIterator != ClientSocketHandle_ptrToID_Map.end()) {
+                    ClientID = ClientIDIterator->second;
+                    ClientSocketHandle_ptrToID_Map.erase(ClientIDIterator);
+                }
+            if (ClientID != 0) {
+                IDToClientSocketHandle_ptr_Map.erase(ClientID);
+            }
             //关闭对应SOCKET
             SocketHandleToSocketGuard_ptr_Map[ClientSocketHandle]->CloseSocketHandle();
-            //清除服务器存储的客户端信息
             std::erase(ClientSockets,SocketHandleToSocketGuard_ptr_Map[ClientSocketHandle]);
-            SocketHandleToSocketGuard_ptr_Map.erase(ClientSocketHandle);
-            ClientSocketHandle_ptrToID_Map.erase(ClientSocketHandle);
-            IDToClientSocketHandle_ptr_Map.erase(ClientSocketHandle_ptrToID_Map[ClientSocketHandle]);
+
             lock.unlock();
             std::unique_lock<std::mutex> IOlock(IOMutex);
             std::cout<<"Client Safe Quit"<<std::endl;
@@ -82,13 +91,13 @@ static bool ForwardMessagesThread(SOCKET& ClientSocketHandle) {
         //检测登录合法性
         if (getMessage.MessageType==static_cast<uint32_t>(MessageType::Login)) {
             std::unique_lock<std::mutex> lock(ClientSocketsAndIDMapMutex);
-            if (IDToClientSocketHandle_ptr_Map.contains(getMessage.UserIDSender)) {
+            if (IDToClientSocketHandle_ptr_Map.contains(getMessage.UserIDSender)) {//ID已被使用
                 lock.unlock();
                 SendMessagesToClient(std::ref(ClientSocketHandle),Message::LoginFailedToken_UsedID);
                 std::unique_lock<std::mutex> IOlock(IOMutex);
                 std::cout<<"Login Failed!"<<std::endl;
             }
-            else {
+            else {//合法登陆ID
                 ClientSocketHandle_ptrToID_Map[ClientSocketHandle]=getMessage.UserIDSender;
                 IDToClientSocketHandle_ptr_Map[getMessage.UserIDSender]=ClientSocketHandle;
                 lock.unlock();
