@@ -1,6 +1,8 @@
 #pragma once
 #include <WinSock2.h>
 #include <ws2def.h>
+#include <atomic>
+#include<mutex>
 
 class WSAGuard {
 public:
@@ -28,10 +30,11 @@ public:
     SocketGuard& operator=(const SocketGuard&)=delete;
 public:
     void CloseSocketHandle() {
-        if (SocketHandle!=INVALID_SOCKET) {
-            closesocket(SocketHandle);
-            SocketHandle=INVALID_SOCKET;
+        const SOCKET Old=SocketHandle.exchange(INVALID_SOCKET);
+        if (Old!=INVALID_SOCKET) {
+            closesocket(Old);
         }
     }
-    SOCKET SocketHandle=INVALID_SOCKET;
+    std::atomic<SOCKET> SocketHandle{INVALID_SOCKET};
+    std::mutex SendMutex;
 };

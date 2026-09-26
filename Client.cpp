@@ -28,12 +28,13 @@ static std::mutex IOMutex,LoginMutex,IDJudgingMutex;
 static std::condition_variable LoginCV,IDJudgingCV;
 
 
-static void LoginRequest(const SocketGuard& ConnectToServerSocket) {
-    MyMessage.MessageType=static_cast<uint32_t>(MessageType::Login);
+static void LoginRequest(SocketGuard& ConnectToServerSocket) {
+    MyMessage.SenderType=static_cast<uint32_t>(SenderTypes::Client);
+    MyMessage.MessageType=static_cast<uint32_t>(ClientMessageTypes::Login);
     MyMessage.UserIDReceiver=0;
 
     auto [pkg,len]=ConvertMessagesToNetStream(MyMessage);//将消息转换为网络字节流
-    SendMessages(ConnectToServerSocket.SocketHandle,pkg.data(),len); //调用发送消息函数
+    SendMessages(ConnectToServerSocket,pkg.data(),len); //调用发送消息函数
 }
 
 static bool WaitingLoginReply() {
@@ -58,9 +59,10 @@ static bool WaitingIDJudging() {
     }
 }
 
-static bool SendMessagesThread(const SocketGuard& ConnectToServerSocket) {//正常关闭返回true
+static bool SendMessagesThread(SocketGuard& ConnectToServerSocket) {//正常关闭返回true
     while (true) {
-        MyMessage.MessageType=static_cast<uint32_t>(MessageType::CheckID);
+        MyMessage.SenderType=static_cast<uint32_t>(SenderTypes::Client);
+        MyMessage.MessageType=static_cast<uint32_t>(ClientMessageTypes::CheckID);
         //输入目标用户ID
         while (true) {
             std::unique_lock<std::mutex> IOlock(IOMutex);
@@ -81,11 +83,12 @@ static bool SendMessagesThread(const SocketGuard& ConnectToServerSocket) {//正�
         }
         //检测ID合法性
         auto [pkg_only_id,len_only_id]=ConvertMessagesToNetStream(MyMessage);//将消息转换为网络字节流
-        SendMessages(ConnectToServerSocket.SocketHandle,pkg_only_id.data(),len_only_id);//调用发送消息函数
+        SendMessages(ConnectToServerSocket,pkg_only_id.data(),len_only_id);//调用发送消息函数
 
         auto IDJudgingResult=MyThreadsPool.AddTask(WaitingIDJudging);
         if (IDJudgingResult.get()) {//ID合法
-            MyMessage.MessageType=static_cast<uint32_t>(MessageType::Normal);
+            MyMessage.SenderType=static_cast<uint32_t>(SenderTypes::Client);
+            MyMessage.MessageType=static_cast<uint32_t>(ClientMessageTypes::Normal);
             std::unique_lock<std::mutex> IOlock(IOMutex);
             std::cout<<"Send Message:";
             IOlock.unlock();
@@ -97,16 +100,13 @@ static bool SendMessagesThread(const SocketGuard& ConnectToServerSocket) {//正�
             }
 
             if (MyMessage.TextMessage=="quit") {
-                MyMessage.MessageType=static_cast<uint32_t>(MessageType::ClientSafeQuit);
-                auto [pkg,len]=ConvertMessagesToNetStream(MyMessage);//将消息转换为网络字节流
-                SendMessages(ConnectToServerSocket.SocketHandle,pkg.data(),len);
                 shutdown(ConnectToServerSocket.SocketHandle,SD_SEND);
                 return true;
             }
 
             //开始发包
             auto [pkg,len]=ConvertMessagesToNetStream(MyMessage);//将消息转换为网络字节流
-            SendMessages(ConnectToServerSocket.SocketHandle,pkg.data(),len);//调用发送消息函数
+            SendMessages(ConnectToServerSocket,pkg.data(),len);//调用发送消息函数
         }
         else {//ID非法
             //由recv获取ID非法的原因，此处直接重头开始循环获取输入
@@ -116,61 +116,115 @@ static bool SendMessagesThread(const SocketGuard& ConnectToServerSocket) {//正�
     return true;
 }
 
-static bool RecvMessagesThread(const SocketGuard& ConnectToServerSocket) {//接受消息,正常退出返回true,异常返回false
+static bool RecvMessagesThread(SocketGuard& ConnectToServerSocket) {//接受消息,正常退出返回true,异常返回false
     while (true) {
-        auto OptMessageJudging = RecvMessages(ConnectToServerSocket.SocketHandle);
+        auto OptMessageJudging = RecvMessages(ConnectToServerSocket.SocketHandle,ReceiverTypes::Client);//阻塞接受消息,接收端(本端)类型是Client
 
+        //异常消息
         if (OptMessageJudging==std::nullopt) {
             return false;
         }
 
         //接受服务器消息
-        if (OptMessageJudging.value().MessageType==static_cast<uint32_t>(MessageType::Server)) {
+        if (OptMessageJudging.value().SenderType==static_cast<uint32_t>(SenderTypes::Server)) {
             const Message& getMessage=OptMessageJudging.value();
+            //探测包相关
+            if (getMessage.MessageType==static_cast<uint32_t>(ServerMessageTypes::Probe)) {
+                Message ProbePack;
+                ProbePack.SenderType=static_cast<uint32_t>(SenderTypes::Client);
+                ProbePack.MessageType=static_cast<uint32_t>(ClientMessageTypes::ReplyProbe);
+                ProbePack.UserIDReceiver=0;
+
+                auto [pkg,len]=ConvertMessagesToNetStream(ProbePack);//将消息转换为网络字节流
+                SendMessages(ConnectToServerSocket,pkg.data(),len); //调用发送消息函数
+
+                //std::lock_guard<std::mutex> IOlock(IOMutex);
+                //std::cout<<"Reply the Probe"<<std::endl;
+            }
             //登录相关
-            if (getMessage.TextMessage==Message::LoginSuccessfulToken) {//登录相关:登录成功
+            if (getMessage.MessageType==static_cast<uint32_t>(ServerMessageTypes::LoginSuccessfulToken)) {//登录相关:登录成功
                 std::unique_lock<std::mutex> Loginlock(LoginMutex);
                 HaveLogged=true;
                 HaveReplyLogged=true;
                 Loginlock.unlock();
                 LoginCV.notify_all();
+                std::lock_guard<std::mutex> IOlock(IOMutex);
+                std::cout<<"Login Successfully"<<std::endl;
             }
-            else if (getMessage.TextMessage==Message::LoginFailedToken_UsedID||getMessage.TextMessage==Message::LoginFailedToken_IDis0){//登录相关:ID已被占用或ID为0
+            else if (getMessage.MessageType==static_cast<uint32_t>(ServerMessageTypes::LoginFailedToken_UsedID)){//ID已被占用
                 std::unique_lock<std::mutex> Loginlock(LoginMutex);
                 HaveLogged=false;
                 HaveReplyLogged=true;
                 Loginlock.unlock();
                 LoginCV.notify_all();
+                std::lock_guard<std::mutex> IOlock(IOMutex);
+                std::cout<<"This ID have been used"<<std::endl;
+            }
+            else if (getMessage.MessageType==static_cast<uint32_t>(ServerMessageTypes::LoginFailedToken_IDis0)) {//ID为0
+                std::unique_lock<std::mutex> Loginlock(LoginMutex);
+                HaveLogged=false;
+                HaveReplyLogged=true;
+                Loginlock.unlock();
+                LoginCV.notify_all();
+                std::lock_guard<std::mutex> IOlock(IOMutex);
+                std::cout<<"ID can't be 0"<<std::endl;
             }
             //目标ID检验相关
-            else if (getMessage.TextMessage==Message::IDLegal) {
+            else if (getMessage.MessageType==static_cast<uint32_t>(ServerMessageTypes::LegalTargetID)) {
                 std::unique_lock<std::mutex> IDJudgelock(IDJudgingMutex);
                 HaveJudgedID=true;
                 IDLegal=true;
                 IDJudgingCV.notify_all();
-            }else if (getMessage.TextMessage==Message::IDIllegal_IDis0||getMessage.TextMessage==Message::IDIllegal_Invalid||getMessage.TextMessage==Message::IDIllegal_TargetSelf) {
+                std::lock_guard<std::mutex> IOlock(IOMutex);
+                std::cout<<"Legal Target."<<std::endl;
+            }else if (getMessage.MessageType==static_cast<uint32_t>(ServerMessageTypes::IllegalTargetID_IDis0)) {
                 std::unique_lock<std::mutex> IDJudgelock(IDJudgingMutex);
                 HaveJudgedID=true;
                 IDLegal=false;
                 IDJudgingCV.notify_all();
+                std::lock_guard<std::mutex> IOlock(IOMutex);
+                std::cout<<"Target can't be 0"<<std::endl;
+            }
+            else if (getMessage.MessageType==static_cast<uint32_t>(ServerMessageTypes::IllegalTargetID_Invalid)) {
+                std::unique_lock<std::mutex> IDJudgelock(IDJudgingMutex);
+                HaveJudgedID=true;
+                IDLegal=false;
+                IDJudgingCV.notify_all();
+                std::lock_guard<std::mutex> IOlock(IOMutex);
+                std::cout<<"Target is Invalid"<<std::endl;
+            }
+            else if (getMessage.MessageType==static_cast<uint32_t>(ServerMessageTypes::IllegalTargetID_TargetSelf)) {
+                std::unique_lock<std::mutex> IDJudgelock(IDJudgingMutex);
+                HaveJudgedID=true;
+                IDLegal=false;
+                IDJudgingCV.notify_all();
+                std::lock_guard<std::mutex> IOlock(IOMutex);
+                std::cout<<"Target can't be self"<<std::endl;
             }
             //发送消息相关
-            else if (getMessage.TextMessage==Message::SendSuccessfully) {
+            else if (getMessage.MessageType==static_cast<uint32_t>(ServerMessageTypes::ForwardSuccessfully)) {
                 std::unique_lock<std::mutex> IOlock(IOMutex);
                 std::cout<<std::endl<<"Send Successfully"<<std::endl;
             }
-            else if (getMessage.TextMessage==Message::SendFailed) {
+            else if (getMessage.MessageType==static_cast<uint32_t>(ServerMessageTypes::ForwardFailed)) {
                 std::unique_lock<std::mutex> IOlock(IOMutex);
                 std::cout<<std::endl<<"Send Failed"<<std::endl;
             }
-            std::unique_lock<std::mutex> IOlock(IOMutex);
-            std::cout<<std::endl<<"Message from Server:"<<getMessage.TextMessage<<std::endl;
-        }
-        //普通转发消息
-        if (OptMessageJudging.value().MessageType==static_cast<uint32_t>(MessageType::Normal)) {
-            const Message& getMessage=OptMessageJudging.value();
-            std::unique_lock<std::mutex> IOlock(IOMutex);
-            std::cout<<std::endl<<"Message Come from ID:"<<getMessage.UserIDSender<<" Contents:"<<getMessage.TextMessage;
+            //普通转发消息
+            else if (OptMessageJudging.value().MessageType==static_cast<uint32_t>(ServerMessageTypes::Forward)) {;
+                std::unique_lock<std::mutex> IOlock(IOMutex);
+                std::cout<<std::endl<<"Message Come from ID:"<<getMessage.UserIDSender<<" Contents:"<<getMessage.TextMessage;
+            }
+            //服务器断连相关
+            else if (OptMessageJudging.value().MessageType==static_cast<uint32_t>(ServerMessageTypes::ServerSafeQuit)) {
+                std::unique_lock<std::mutex> IOlock(IOMutex);
+                std::cout<<std::endl<<"Server closed Connect Safely"<<std::endl;
+                return true;
+            }else if (OptMessageJudging.value().MessageType==static_cast<uint32_t>(ServerMessageTypes::ServerErrorQuit)) {
+                std::unique_lock<std::mutex> IOlock(IOMutex);
+                std::cout<<std::endl<<"Server closed Connect Wrongly"<<std::endl;
+                return true;
+            }
         }
     }
 }
@@ -209,6 +263,7 @@ int main() {
 
     MyThreadsPool.AddTask(RecvMessagesThread,std::ref(ConnectToServerSocket));
 
+    //登陆
     while (true) {
         IOlock.lock();
         std::cout<<"Input Your User ID: ";
